@@ -42,7 +42,7 @@
         NUMBER_OF_PRELOADS: 1,
         VOCAB_SIZE: '250%',
         MINIMUM_EXAMPLE_LENGTH: 0,
-        HOTKEYS: ['None'], // descriptive enough?
+        HOTKEYS: ['None'],
         DEFAULT_TO_EXACT_SEARCH: true
         // On changing this config option, the icons change but the sentences don't, so you
         // have to click once to match up the icons and again to actually change the sentences
@@ -875,7 +875,8 @@
         }
     }
 
-    let hotkeysListener; // has to be declared p sure
+    // has to be declared (referenced in multiple functions but definition requires variables local to one function)
+    let hotkeysListener;
 
     function renderImageAndPlayAudio(vocab, shouldAutoPlaySound) {
         const example = state.examples[state.currentExampleIndex] || {};
