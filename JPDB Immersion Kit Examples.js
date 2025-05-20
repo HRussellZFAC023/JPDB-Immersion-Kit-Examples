@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         JPDB Immersion Kit Examples
-// @version      1.22
+// @version      1.23
 // @description  Embeds anime images & audio examples into JPDB review and vocabulary pages using Immersion Kit's API. Compatible only with TamperMonkey.
 // @author       awoo
 // @namespace    jpdb-immersion-kit-examples
@@ -58,7 +58,10 @@
         currentAudio: null,
         exactSearch: true,
         error: false,
-        currentlyPlayingAudio: false
+        currentlyPlayingAudio: false,
+        sharedAudioContext:  new (window.AudioContext || window.webkitAudioContext)(),
+        currentSource: null,
+        lastPlayId: 0,
     };
 
     // Prefixing
@@ -113,77 +116,95 @@
 
     // IndexedDB Manager
     const IndexedDBManager = {
+        DB_NAME: 'ImmersionKitDB',
+        DB_VERSION: 2, // bump version to create metaStore
+        DATA_STORE: 'dataStore',
+        META_STORE: 'metaStore',
+        META_KEY: 'index_meta',
         MAX_ENTRIES: 100000000,
-        EXPIRATION_TIME: 30 * 24 * 60 * 60 * 1000 * 12 * 10000, // 10000 years in milliseconds
+        EXPIRATION_TIME: 30 * 24 * 60 * 60 * 1000 * 12 * 10000, // 10000 years
 
         open() {
             return new Promise((resolve, reject) => {
-                const request = indexedDB.open('ImmersionKitDB', 1);
-                request.onupgradeneeded = function(event) {
+                const request = indexedDB.open(this.DB_NAME, this.DB_VERSION);
+
+                request.onupgradeneeded = event => {
                     const db = event.target.result;
-                    if (!db.objectStoreNames.contains('dataStore')) {
-                        db.createObjectStore('dataStore', { keyPath: 'keyword' });
+                    if (!db.objectStoreNames.contains(this.DATA_STORE)) {
+                        db.createObjectStore(this.DATA_STORE, { keyPath: 'keyword' });
+                    }
+                    if (!db.objectStoreNames.contains(this.META_STORE)) {
+                        db.createObjectStore(this.META_STORE, { keyPath: 'key' });
                     }
                 };
-                request.onsuccess = function(event) {
-                    resolve(event.target.result);
-                };
-                request.onerror = function(event) {
-                    reject('IndexedDB error: ' + event.target.errorCode);
-                };
+
+                request.onsuccess = event => resolve(event.target.result);
+                request.onerror = event => reject('IndexedDB error: ' + event.target.errorCode);
             });
         },
 
+        // ---------- META STORE ----------
+        getMetadata(db) {
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction([this.META_STORE], 'readonly');
+                const store = tx.objectStore(this.META_STORE);
+                const req = store.get(this.META_KEY);
+
+                req.onsuccess = e => {
+                    const rec = e.target.result;
+                    resolve(rec ? rec.data : null);
+                };
+                req.onerror = e => reject('Failed to read metadata: ' + e.target.errorCode);
+            });
+        },
+
+        saveMetadata(db, metadata) {
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction([this.META_STORE], 'readwrite');
+                const store = tx.objectStore(this.META_STORE);
+                const rec = { key: this.META_KEY, data: metadata, timestamp: Date.now() };
+                const req = store.put(rec);
+                req.onsuccess = () => resolve();
+                req.onerror = e => reject('Failed to save metadata: ' + e.target.errorCode);
+            });
+        },
+
+        // ---------- DATA STORE ----------
         get(db, keyword) {
             return new Promise((resolve, reject) => {
-                const transaction = db.transaction(['dataStore'], 'readonly');
-                const store = transaction.objectStore('dataStore');
-                const request = store.get(keyword);
-                request.onsuccess = async function(event) {
-                    const result = event.target.result;
-                    if (result) {
-                        const isExpired = Date.now() - result.timestamp >= this.EXPIRATION_TIME;
-                        const validationError = validateApiResponse(result.data);
+                const tx = db.transaction([this.DATA_STORE], 'readonly');
+                const store = tx.objectStore(this.DATA_STORE);
+                const req = store.get(keyword);
 
-                        if (isExpired) {
-                            console.log(`Deleting entry for keyword "${keyword}" because it is expired.`);
-                            await this.deleteEntry(db, keyword);
-                            resolve(null);
-                        } else if (validationError) {
-                            console.log(`Deleting entry for keyword "${keyword}" due to validation error: ${validationError}`);
-                            await this.deleteEntry(db, keyword);
-                            resolve(null);
-                        } else {
-                            resolve(result.data);
-                        }
-                    } else {
-                        resolve(null);
-                    }
-                }.bind(this);
-                request.onerror = function(event) {
-                    reject('IndexedDB get error: ' + event.target.errorCode);
+                req.onsuccess = async e => {
+                    const result = e.target.result;
+                    if (!result) return resolve(null);
+
+                    // Return the data field directly
+                    resolve(result.data ? result.data : result);
                 };
+
+                req.onerror = e => reject('IndexedDB get error: ' + e.target.errorCode);
             });
         },
 
         deleteEntry(db, keyword) {
             return new Promise((resolve, reject) => {
-                const transaction = db.transaction(['dataStore'], 'readwrite');
-                const store = transaction.objectStore('dataStore');
-                const request = store.delete(keyword);
-                request.onsuccess = () => resolve();
-                request.onerror = (e) => reject('IndexedDB delete error: ' + e.target.errorCode);
+                const tx = db.transaction([this.DATA_STORE], 'readwrite');
+                const store = tx.objectStore(this.DATA_STORE);
+                const req = store.delete(keyword);
+                req.onsuccess = () => resolve();
+                req.onerror = e => reject('IndexedDB delete error: ' + e.target.errorCode);
             });
         },
 
-
         getAll(db) {
             return new Promise((resolve, reject) => {
-                const transaction = db.transaction(['dataStore'], 'readonly');
-                const store = transaction.objectStore('dataStore');
+                const tx = db.transaction([this.DATA_STORE], 'readonly');
+                const store = tx.objectStore(this.DATA_STORE);
                 const entries = [];
-                store.openCursor().onsuccess = function(event) {
-                    const cursor = event.target.result;
+                store.openCursor().onsuccess = e => {
+                    const cursor = e.target.result;
                     if (cursor) {
                         entries.push(cursor.value);
                         cursor.continue();
@@ -191,9 +212,29 @@
                         resolve(entries);
                     }
                 };
-                store.openCursor().onerror = function(event) {
-                    reject('Failed to retrieve entries via cursor: ' + event.target.errorCode);
-                };
+                store.openCursor().onerror = e => reject('Cursor error: ' + e.target.errorCode);
+            });
+        },
+
+        // Fallback network fetch
+        fetchMetadata() {
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: "GET",
+                    url: "https://apiv2.immersionkit.com/index_meta",
+                    onload: res => {
+                        if (res.status === 200) {
+                            try {
+                                resolve(JSON.parse(res.responseText));
+                            } catch (err) {
+                                reject('Invalid JSON: ' + err);
+                            }
+                        } else {
+                            reject('HTTP ' + res.status);
+                        }
+                    },
+                    onerror: err => reject('Network error: ' + err)
+                });
             });
         },
 
@@ -202,105 +243,182 @@
                 try {
                     const validationError = validateApiResponse(data);
                     if (validationError) {
-                        console.log(`Invalid data detected: ${validationError}. Not saving to IndexedDB.`);
+                        console.warn(`Invalid data: ${validationError}`);
+                        return resolve();
+                    }
+
+                    // 1) load metadata from DB (or fetch & save if missing)
+                    let metadata = await this.getMetadata(db);
+                    if (!metadata) {
+                        metadata = await this.fetchMetadata();
+                        await this.saveMetadata(db, metadata);
+                    }
+
+                    // 2) slim down
+                    const slimData = {};
+                    if (data.category_count) slimData.category_count = data.category_count;
+                    if (!Array.isArray(data.examples)) {
+                        console.error('Unexpected examples format');
+                        return resolve();
+                    }
+
+                    // 3) map & patch titles
+                    const categoryOrder = ['anime', 'drama', 'games', 'literature', 'news'];
+                    let slimExamples = await Promise.all(data.examples.map(async ex => {
+                        const slim = {
+                            image: ex.image,
+                            sound: ex.sound,
+                            sentence: ex.sentence,
+                            translation: ex.translation,
+                            title: ex.title,
+                            media: ex.id ? ex.id.split('_')[0] : undefined
+                        };
+
+                        // if title not in our local metadata, re-fetch & update
+                        if (!metadata.data[slim.title]) {
+                            metadata = await this.fetchMetadata();
+                            await this.saveMetadata(db, metadata);
+                        }
+
+                        const entry = metadata.data[slim.title];
+                        if (entry) slim.title = entry.title;
+                        return slim;
+                    }));
+
+                    // Check state.exactSearch and filter examples
+                    console.log('State exactSearch:', state.exactSearch);
+                    console.log('State vocab:', state.vocab);
+
+                    const totalExamplesBefore = slimExamples.length;
+                    console.log('Total examples before filtering:', totalExamplesBefore);
+
+                    if (state.exactSearch) {
+                        const initialCount = slimExamples.length;
+                        slimExamples = slimExamples.filter(ex => ex.sentence.includes(state.vocab));
+                        const removedCount = initialCount - slimExamples.length;
+                        console.log('Number of examples removed:', removedCount);
+                    }
+
+                    const totalExamplesAfter = slimExamples.length;
+                    console.log('Total examples after filtering:', totalExamplesAfter);
+
+                    // 4) sort
+                    slimExamples.sort((a, b) => {
+                        const ca = categoryOrder.indexOf(a.media);
+                        const cb = categoryOrder.indexOf(b.media);
+                        if (ca !== cb) return ca - cb;
+                        return a.sentence.length - b.sentence.length;
+                    });
+                    slimData.examples = slimExamples;
+
+                    // 5) enforce MAX_ENTRIES
+                    const all = await this.getAll(db);
+                    const tx = db.transaction([this.DATA_STORE], 'readwrite');
+                    const store = tx.objectStore(this.DATA_STORE);
+
+                    if (all.length >= this.MAX_ENTRIES) {
+                        all
+                            .sort((a, b) => a.timestamp - b.timestamp)
+                            .slice(0, all.length - this.MAX_ENTRIES + 1)
+                            .forEach(old => store.delete(old.keyword));
+                    }
+
+                    // 6) put new record
+                    store.put({ keyword, data: slimData, timestamp: Date.now() });
+
+                    tx.oncomplete = () => {
+                        console.log('Save complete');
                         resolve();
-                        return;
-                    }
-
-                    // Transform the JSON object to slim it down
-                    let slimData = {};
-                    if (data && data.data) {
-                        slimData.data = data.data.map(item => {
-                            const slimItem = {};
-
-                            // Keep the category_count section
-                            if (item.category_count) {
-                                slimItem.category_count = item.category_count;
-                            }
-
-                            // Slim down the examples section
-                            if (item.examples && Array.isArray(item.examples)) {
-                                const slimExamples = item.examples.map(example => ({
-                                    image_url: example.image_url,
-                                    sound_url: example.sound_url,
-                                    sentence: example.sentence,
-                                    translation: example.translation,
-                                    deck_name: example.deck_name
-                                }));
-                                slimItem.examples = slimExamples;
-                            }
-
-                            return slimItem;
-                        });
-                    } else {
-                        console.error('Data does not contain expected structure. Cannot slim down.');
-                        resolve();
-                        return;
-                    }
-
-                    const entries = await this.getAll(db);
-                    const transaction = db.transaction(['dataStore'], 'readwrite');
-                    const store = transaction.objectStore('dataStore');
-
-                    if (entries.length >= this.MAX_ENTRIES) {
-                        // Sort entries by timestamp and delete oldest ones
-                        entries.sort((a, b) => a.timestamp - b.timestamp);
-                        const entriesToDelete = entries.slice(0, entries.length - this.MAX_ENTRIES + 1);
-
-                        // Delete old entries
-                        entriesToDelete.forEach(entry => {
-                            store.delete(entry.keyword).onerror = function() {
-                                console.error('Failed to delete entry:', entry.keyword);
-                            };
-                        });
-                    }
-
-                    // Add the new slimmed entry
-                    const addRequest = store.put({ keyword, data: slimData, timestamp: Date.now() });
-                    addRequest.onsuccess = () => resolve();
-                    addRequest.onerror = (e) => reject('IndexedDB save error: ' + e.target.errorCode);
-
-                    transaction.oncomplete = function() {
-                        console.log('IndexedDB updated successfully.');
                     };
+                    tx.onerror = e => reject('Save transaction failed: ' + e.target.errorCode);
 
-                    transaction.onerror = function(event) {
-                        reject('IndexedDB update failed: ' + event.target.errorCode);
-                    };
-
-                } catch (error) {
-                    reject(`Error in saveToIndexedDB: ${error}`);
+                } catch (err) {
+                    reject('Error in save(): ' + err);
                 }
             });
         },
 
+        async versionupdate(db, searchVocab) {
+            return new Promise(async (resolve, reject) => {
+                try {
+                    // Fetch the existing data for the given searchVocab
+                    let cachedData = await this.get(db, searchVocab);
+
+                    if (!cachedData || !cachedData.data) {
+                        return resolve(); // No data to update
+                    }
+
+                    // Check if cachedData.data is an array and extract the first element
+                    const dataToTransform = Array.isArray(cachedData.data) ? cachedData.data[0] : cachedData.data;
+
+                    // Transform the data
+                    const updatedData = {
+                        category_count: dataToTransform.category_count,
+                        examples: dataToTransform.examples.map(example => {
+                            const imageUrlParts = example.image_url.split('/');
+                            const soundUrlParts = example.sound_url.split('/');
+
+                            // Extract media from the URL
+                            const mediaIndex = imageUrlParts.indexOf('media');
+                            const media = mediaIndex !== -1 && mediaIndex + 1 < imageUrlParts.length ? imageUrlParts[mediaIndex + 1] : '';
+
+                            return {
+                                image: imageUrlParts[imageUrlParts.length - 1],
+                                sound: soundUrlParts[soundUrlParts.length - 1],
+                                sentence: example.sentence,
+                                translation: example.translation,
+                                title: example.deck_name,
+                                media: media,
+                            };
+                        })
+                    };
+
+                    // Open a readwrite transaction on your data store
+                    const tx = db.transaction([this.DATA_STORE], 'readwrite');
+                    const store = tx.objectStore(this.DATA_STORE);
+
+                    // Put the new record directly
+                    store.put({
+                        keyword: searchVocab,
+                        data: updatedData,
+                        timestamp: Date.now()
+                    });
+
+                    tx.oncomplete = () => {
+                        console.log('Version update complete');
+                        resolve();
+                    };
+                    tx.onerror = e => {
+                        console.error('Version update transaction failed:', e.target.errorCode);
+                        reject('Version update transaction failed: ' + e.target.errorCode);
+                    };
+
+                } catch (error) {
+                    console.error('Error in versionupdate:', error);
+                    reject('Error in versionupdate: ' + error);
+                }
+            });
+        }
+        ,
+
+
         delete() {
             return new Promise((resolve, reject) => {
-                const request = indexedDB.deleteDatabase('ImmersionKitDB');
-                request.onsuccess = function() {
-                    console.log('IndexedDB deleted successfully');
-                    resolve();
-                };
-                request.onerror = function(event) {
-                    console.error('Error deleting IndexedDB:', event.target.errorCode);
-                    reject('Error deleting IndexedDB: ' + event.target.errorCode);
-                };
-                request.onblocked = function() {
-                    console.warn('Delete operation blocked. Please close all other tabs with this site open and try again.');
-                    reject('Delete operation blocked');
-                };
+                const req = indexedDB.deleteDatabase(this.DB_NAME);
+                req.onsuccess = () => resolve();
+                req.onerror = e => reject('Delete failed: ' + e.target.errorCode);
+                req.onblocked = () => reject('Delete blocked; close all other tabs');
             });
         }
     };
 
 
+
     // API FUNCTIONS=====================================================================================================================
     function getImmersionKitData(vocab, exactSearch) {
-
-
         return new Promise(async (resolve, reject) => {
             const searchVocab = exactSearch ? `「${vocab}」` : vocab;
-            const url = `https://api.immersionkit.com/look_up_dictionary?keyword=${encodeURIComponent(searchVocab)}&sort=shortness&min_length=${CONFIG.MINIMUM_EXAMPLE_LENGTH}`;
+            const url = `https://apiv2.immersionkit.com/search?q=${encodeURIComponent(searchVocab)}`;
             const maxRetries = 5;
             let attempt = 0;
 
@@ -316,11 +434,19 @@
             async function fetchData() {
                 try {
                     const db = await IndexedDBManager.open();
-                    const cachedData = await IndexedDBManager.get(db, searchVocab);
+                    let cachedData = await IndexedDBManager.get(db, searchVocab);
+
+                    // Check if the cached data is outdated (v1 API data with 'data' field as an array)
                     if (cachedData && Array.isArray(cachedData.data) && cachedData.data.length > 0) {
+                        console.log('Outdated data detected, updating...');
+                        await IndexedDBManager.versionupdate(db, searchVocab);
+                        // Rerun fetchData after updating
+                        return fetchData();
+                    } else if (cachedData && cachedData.examples && Array.isArray(cachedData.examples) && cachedData.examples.length > 0) {
                         console.log('Data retrieved from IndexedDB');
-                        state.examples = cachedData.data[0].examples;
+                        state.examples = cachedData.examples;
                         state.apiDataFetched = true;
+                        updateCurrentExampleIndex();
                         resolve();
                     } else {
                         console.log(`Calling API for: ${searchVocab}`);
@@ -334,10 +460,19 @@
                                     console.log(url);
                                     const validationError = validateApiResponse(jsonData);
                                     if (!validationError) {
-                                        state.examples = jsonData.data[0].examples;
-                                        state.apiDataFetched = true;
                                         await IndexedDBManager.save(db, searchVocab, jsonData);
-                                        resolve();
+
+                                        // Attempt to load the data from cache again after saving
+                                        cachedData = await IndexedDBManager.get(db, searchVocab);
+                                        if (cachedData && cachedData.examples && Array.isArray(cachedData.examples)) {
+                                            console.log('Data retrieved from IndexedDB after saving');
+                                            state.examples = cachedData.examples;
+                                            state.apiDataFetched = true;
+                                            updateCurrentExampleIndex();
+                                            resolve();
+                                        } else {
+                                            reject('Failed to retrieve data from IndexedDB after saving');
+                                        }
                                     } else {
                                         attempt++;
                                         if (attempt < maxRetries) {
@@ -346,7 +481,7 @@
                                         } else {
                                             reject(`Invalid API response after ${maxRetries} attempts: ${validationError}`);
                                             state.error = true;
-                                            embedImageAndPlayAudio(); //update displayed text
+                                            embedImageAndPlayAudio(); // Update displayed text
                                         }
                                     }
                                 } else {
@@ -363,6 +498,26 @@
                 }
             }
 
+            function updateCurrentExampleIndex() {
+                const storedValue = getItem(state.vocab);
+
+                if (storedValue) {
+                    // If stored data exists, use it to update the current example index
+                    const storedIndex = parseInt(storedValue, 10);
+
+                    // Update the current example index with the stored index
+                    state.currentExampleIndex = storedIndex;
+                    return;
+                }
+
+                // If no stored data exists, check sentence length
+                for (let i = 0; i < state.examples.length; i++) {
+                    if (state.examples[i].sentence.length >= CONFIG.MINIMUM_EXAMPLE_LENGTH) {
+                        state.currentExampleIndex = i;
+                        break;
+                    }
+                }
+            }
             fetchData();
         });
     }
@@ -381,13 +536,13 @@
         if (!jsonData) {
             return 'Not a valid JSON';
         }
-        if (!jsonData.data || !jsonData.data[0] || !jsonData.data[0].examples) {
+        if (!jsonData.category_count || !jsonData.examples) {
             return 'Missing required data fields';
         }
 
-        const categoryCount = jsonData.data[0].category_count;
-        if (!categoryCount) {
-            return 'Missing category count';
+        const categoryCount = jsonData.category_count;
+        if (!categoryCount || Object.keys(categoryCount).length === 0) {
+            return 'Missing or empty category count';
         }
 
         // Check if all category counts are zero
@@ -396,9 +551,13 @@
             return 'Blank API';
         }
 
+        const examples = jsonData.examples;
+        if (!Array.isArray(examples) || examples.length === 0) {
+            return 'Missing or empty examples array';
+        }
+
         return null; // No error
     }
-
 
     //FAVORITE DATA FUNCTIONS=====================================================================================================================
     function getStoredData(key) {
@@ -765,14 +924,19 @@
     }
 
     function createTextButton(vocab, exact) {
-        // Create a text button for the Immersion Kit
         const textButton = document.createElement('a');
         textButton.textContent = 'Immersion Kit';
         textButton.style.color = 'var(--subsection-label-color)';
         textButton.style.fontSize = '85%';
         textButton.style.marginRight = '0.5rem';
         textButton.style.verticalAlign = 'middle';
-        textButton.href = `https://www.immersionkit.com/dictionary?keyword=${encodeURIComponent(vocab)}&sort=shortness${exact ? '&exact=true' : ''}`;
+
+        const url = new URL('https://www.immersionkit.com/dictionary');
+        url.searchParams.set('keyword', vocab);
+        url.searchParams.set('sort', 'sentence_length:asc');
+        if (exact) url.searchParams.set('exact', 'true');
+
+        textButton.href = url.toString();
         textButton.target = '_blank';
         return textButton;
     }
@@ -806,87 +970,97 @@
         return buttonContainer;
     }
 
+    // ——— Stop any playing audio ———
     function stopCurrentAudio() {
-        // Stop any currently playing audio
-        if (state.currentAudio) {
-            state.currentAudio.source.stop();
-            state.currentAudio.context.close();
-            state.currentAudio = null;
+        if (state.currentSource) {
+            try {
+                state.currentSource.onended = null;
+                state.currentSource.stop(0);
+                state.currentSource.disconnect();
+            } catch (e) { /* already stopped? ignore */ }
+            state.currentSource = null;
         }
     }
 
+    // ——— Play a new clip ———
     function playAudio(soundUrl) {
-        // Skip playing audio if it is already playing
-        if (state.currentlyPlayingAudio) {
-            //console.log('Duplicate audio was skipped.');
-            return;
+        if (!soundUrl) return;
+
+        // 1) bump play ID to cancel any in-flight requests/decodes
+        const playId = ++state.lastPlayId;
+
+        // 2) tear down old source instantly
+        stopCurrentAudio();
+
+        // 3) ensure context is resumed (autoplay policy)
+        if (state.sharedAudioContext.state === 'suspended') {
+            state.sharedAudioContext.resume().catch(() => {});
         }
 
-        if (soundUrl) {
-            state.currentlyPlayingAudio = true;
-            stopCurrentAudio();
+        // 4) fetch via GM_xmlhttpRequest
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url: soundUrl,
+            responseType: 'arraybuffer',
+            onload(response) {
+                // if a newer playAudio() ran, abort
+                if (playId !== state.lastPlayId) return;
 
-            GM_xmlhttpRequest({
-                method: 'GET',
-                url: soundUrl,
-                responseType: 'arraybuffer',
-                onload: function(response) {
-                    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                    audioContext.decodeAudioData(response.response, function(buffer) {
-                        const source = audioContext.createBufferSource();
-                        source.buffer = buffer;
+                state.sharedAudioContext.decodeAudioData(
+                    response.response,
+                    buffer => {
+                        if (playId !== state.lastPlayId) return;
 
-                        const gainNode = audioContext.createGain();
+                        // wire up new source + gain
+                        const src = state.sharedAudioContext.createBufferSource();
+                        src.buffer = buffer;
+                        const gain = state.sharedAudioContext.createGain();
+                        gain.gain.setValueAtTime(0, state.sharedAudioContext.currentTime);
+                        gain.gain.linearRampToValueAtTime(
+                            (CONFIG.SOUND_VOLUME || 100) / 100,
+                            state.sharedAudioContext.currentTime + 0.05
+                        );
+                        src.connect(gain).connect(state.sharedAudioContext.destination);
 
-                        // Connect the source to the gain node and the gain node to the destination
-                        source.connect(gainNode);
-                        gainNode.connect(audioContext.destination);
+                        // start (skip initial 50 ms to avoid pop)
+                        src.start(0, 0.05);
 
-                        // Mute the first part and then ramp up the volume
-                        gainNode.gain.setValueAtTime(0, audioContext.currentTime);
-                        gainNode.gain.linearRampToValueAtTime(CONFIG.SOUND_VOLUME / 100, audioContext.currentTime + 0.1);
-
-                        // Play the audio, skip the first part to avoid any "pop"
-                        source.start(0, 0.05);
-
-                        // Log when the audio starts playing
-                        //console.log('Audio has started playing.');
-
-                        // Save the current audio context and source for stopping later
-                        state.currentAudio = {
-                            context: audioContext,
-                            source: source
+                        // when it ends, clear the reference if still “ours”
+                        src.onended = () => {
+                            if (state.currentSource === src) {
+                                state.currentSource = null;
+                            }
                         };
 
-                        // Set currentlyPlayingAudio to false when the audio ends
-                        source.onended = function() {
-                            state.currentlyPlayingAudio = false;
-                        };
-                    }, function(error) {
-                        console.error('Error decoding audio:', error);
-                        state.currentlyPlayingAudio = false;
-                    });
-                },
-                onerror: function(error) {
-                    console.error('Error fetching audio:', error);
-                    state.currentlyPlayingAudio = false;
-                }
-            });
-        }
+                        // hold onto it so stopCurrentAudio() can find it
+                        state.currentSource = src;
+                    },
+                    err => {
+                        console.error('decodeAudioData failed:', err);
+                    }
+                );
+            },
+            onerror(err) {
+                console.error('GM_xmlhttpRequest failed:', err);
+            }
+        });
     }
+
+
 
     // has to be declared (referenced in multiple functions but definition requires variables local to one function)
     let hotkeysListener;
 
     function renderImageAndPlayAudio(vocab, shouldAutoPlaySound) {
         const example = state.examples[state.currentExampleIndex] || {};
-        const imageUrl = example.image_url || null;
-        const soundUrl = example.sound_url || null;
+        const imageUrl = example.image ? `https://us-southeast-1.linodeobjects.com/immersionkit/media/${example.media}/${example.title}/media/${example.image}` : null;
+        const soundUrl = example.sound ? `https://us-southeast-1.linodeobjects.com/immersionkit/media/${example.media}/${example.title}/media/${example.sound}` : null;
         const sentence = example.sentence || null;
         const translation = example.translation || null;
-        const deck_name = example.deck_name || null;
+        const title = example.title || null;
         const storedValue = getItem(state.vocab);
         const isBlacklisted = storedValue && storedValue.split(',').length > 1 && parseInt(storedValue.split(',')[1], 10) === 2;
+
 
         // Remove any existing container
         removeExistingContainer();
@@ -896,7 +1070,6 @@
         const wrapperDiv = createWrapperDiv();
         const textDiv = createButtonContainer(soundUrl, vocab, state.exactSearch);
         wrapperDiv.appendChild(textDiv);
-
 
 
         const createTextElement = (text) => {
@@ -917,7 +1090,7 @@
                     imageElement.addEventListener('click', () => playAudio(soundUrl));
                 }
             } else {
-                wrapperDiv.appendChild(createTextElement(`NO IMAGE\n(${deck_name})`));
+                wrapperDiv.appendChild(createTextElement(`NO IMAGE\n(${title})`));
             }
             // Append sentence and translation or a placeholder text
             sentence ? appendSentenceAndTranslation(wrapperDiv, sentence, translation) : appendNoneText(wrapperDiv);
@@ -926,8 +1099,6 @@
         } else {
             wrapperDiv.appendChild(createTextElement('LOADING'));
         }
-
-
 
         // Create navigation elements
         const navigationDiv = createNavigationDiv();
@@ -945,9 +1116,9 @@
 
         // Link hotkeys
         if (CONFIG.HOTKEYS.indexOf("None") === -1) {
-        const leftHotkey = CONFIG.HOTKEYS[0];
-        const rightHotkey = CONFIG.HOTKEYS[1];
-    
+            const leftHotkey = CONFIG.HOTKEYS[0];
+            const rightHotkey = CONFIG.HOTKEYS[1];
+
             hotkeysListener = (event) => {
                 if (event.repeat) return;
                 switch (event.key.toLowerCase()) {
@@ -972,7 +1143,7 @@
                         window.addEventListener('keydown', hotkeysListener, {once: true});
                 }
             }
-            
+
             window.addEventListener('keydown', hotkeysListener, {once: true});
         }
     }
@@ -1008,7 +1179,7 @@
         // Create and return an image element with specified attributes
         const searchVocab = exactSearch ? `「${vocab}」` : vocab;
         const example = state.examples[state.currentExampleIndex] || {};
-        const deck_name = example.deck_name || null;
+        const title = example.title || null;
 
         // Extract the file name from the URL
         let file_name = imageUrl.substring(imageUrl.lastIndexOf('/') + 1);
@@ -1016,7 +1187,7 @@
         // Remove prefixes "Anime_", "A_", or "Z" from the file name
         file_name = file_name.replace(/^(Anime_|A_|Z)/, '');
 
-        const titleText = `${searchVocab} #${state.currentExampleIndex + 1} \n${deck_name} \n${file_name}`;
+        const titleText = `${searchVocab} #${state.currentExampleIndex + 1} \n${title} \n${file_name}`;
 
         return GM_addElement(wrapperDiv, 'img', {
             src: imageUrl,
@@ -1104,6 +1275,7 @@
             if (state.currentExampleIndex > 0) {
                 state.currentExampleIndex--;
                 state.currentlyPlayingAudio = false;
+                stopCurrentAudio();
                 renderImageAndPlayAudio(vocab, shouldAutoPlaySound);
                 preloadImages();
             }
@@ -1129,6 +1301,7 @@
             if (state.currentExampleIndex < state.examples.length - 1) {
                 state.currentExampleIndex++;
                 state.currentlyPlayingAudio = false;
+                stopCurrentAudio();
                 renderImageAndPlayAudio(vocab, shouldAutoPlaySound);
                 preloadImages();
             }
@@ -1195,7 +1368,7 @@
                 wrapper.appendChild(originalContentWrapper);
                 wrapper.appendChild(containerDiv);
             }
-            
+
             if (vboxGap) {
                 const existingDynamicDiv = vboxGap.querySelector('#dynamic-content');
                 if (existingDynamicDiv) {
@@ -1246,8 +1419,10 @@
         const endIndex = Math.min(state.examples.length - 1, state.currentExampleIndex + CONFIG.NUMBER_OF_PRELOADS);
 
         for (let i = startIndex; i <= endIndex; i++) {
-            if (!state.preloadedIndices.has(i) && state.examples[i].image_url) {
-                GM_addElement(preloadDiv, 'img', { src: state.examples[i].image_url });
+            if (!state.preloadedIndices.has(i) && state.examples[i].image) {
+                const example = state.examples[i];
+                const imageUrl = `https://us-southeast-1.linodeobjects.com/immersionkit/media/${example.media}/${example.title}/media/${example.image}`;
+                GM_addElement(preloadDiv, 'img', { src: imageUrl });
                 state.preloadedIndices.add(i);
             }
         }
@@ -1428,11 +1603,12 @@
         const saveButton = createButton('Save', '10px', saveConfig, actionButtonWidth);
         const defaultButton = createDefaultButton(actionButtonWidth);
         const deleteButton = createDeleteButton(actionButtonWidth);
+        const deleteCurrentVocabButton = createDeleteCurrentVocabButton('400px');
 
         const actionButtonsContainer = document.createElement('div');
         actionButtonsContainer.style.textAlign = 'center';
         actionButtonsContainer.style.marginTop = '10px';
-        actionButtonsContainer.append(closeButton, saveButton, defaultButton, deleteButton);
+        actionButtonsContainer.append(closeButton, saveButton, defaultButton, deleteButton, deleteCurrentVocabButton);
 
         return actionButtonsContainer;
     }
@@ -1519,21 +1695,15 @@
         if (!overlay) return;
 
         const inputs = overlay.querySelectorAll('input, span');
-        const { changes, minimumExampleLengthChanged, newMinimumExampleLength } = gatherChanges(inputs);
+        const changes = gatherChanges(inputs);
 
-        if (minimumExampleLengthChanged) {
-            handleMinimumExampleLengthChange(newMinimumExampleLength, changes);
-        } else {
-            applyChanges(changes);
-            finalizeSaveConfig();
-            setVocabSize();
-            setPageWidth();
-        }
+        applyChanges(changes);
+        finalizeSaveConfig();
+        setVocabSize();
+        setPageWidth();
     }
 
     function gatherChanges(inputs) {
-        let minimumExampleLengthChanged = false;
-        let newMinimumExampleLength;
         const changes = {};
 
         inputs.forEach(input => {
@@ -1555,46 +1725,11 @@
                 const typePart = input.getAttribute('data-type-part');
                 const originalFormattedType = typePart.slice(1, -1);
 
-                if (key === 'MINIMUM_EXAMPLE_LENGTH' && CONFIG.MINIMUM_EXAMPLE_LENGTH !== value) {
-                    minimumExampleLengthChanged = true;
-                    newMinimumExampleLength = value;
-                }
-
                 changes[configPrefix + key] = value + originalFormattedType;
             }
         });
 
-        return { changes, minimumExampleLengthChanged, newMinimumExampleLength };
-    }
-
-    function handleMinimumExampleLengthChange(newMinimumExampleLength, changes) {
-        createConfirmationPopup(
-            'Changing Minimum Example Length will break your current favorites. They will all be deleted. Are you sure?',
-            async () => {
-                await IndexedDBManager.delete();
-                CONFIG.MINIMUM_EXAMPLE_LENGTH = newMinimumExampleLength;
-                setItem(`${configPrefix}MINIMUM_EXAMPLE_LENGTH`, newMinimumExampleLength);
-                applyChanges(changes);
-                clearNonConfigLocalStorage();
-                finalizeSaveConfig();
-                location.reload();
-            },
-            () => {
-                const overlay = document.getElementById('overlayMenu');
-                document.body.removeChild(overlay);
-                document.body.appendChild(createOverlayMenu());
-            }
-        );
-    }
-
-    function clearNonConfigLocalStorage() {
-        for (let i = 0; i < localStorage.length; i++) {
-            const key = localStorage.key(i);
-            if (key && key.startsWith(scriptPrefix) && !key.startsWith(scriptPrefix + configPrefix)) {
-                localStorage.removeItem(key);
-                i--; // Adjust index after removal
-            }
-        }
+        return changes;
     }
 
     function applyChanges(changes) {
@@ -1612,6 +1747,7 @@
             document.body.removeChild(overlay);
         }
     }
+
 
 
     ////DEFAULT BUTTON
@@ -1644,6 +1780,42 @@
 
 
     ////DELETE BUTTON
+    async function deleteCurrentVocab() {
+        try {
+            const db = await IndexedDBManager.open();
+            let currentVocab = state.vocab;
+
+            // Wrap currentVocab with angle quotes if exactSearch is true
+            if (state.exactSearch) {
+                currentVocab = `「${currentVocab}」`;
+            }
+
+            // Delete from IndexedDB
+            await IndexedDBManager.deleteEntry(db, currentVocab);
+            console.log('Deleting from IndexedDB:', currentVocab);
+
+            // Delete from local storage
+            const localStorageKey = scriptPrefix + state.vocab;
+            if (localStorage.getItem(localStorageKey)) {
+                localStorage.removeItem(localStorageKey);
+                console.log('Deleting from local storage:', localStorageKey);
+            }
+
+            alert('Current vocabulary deleted successfully!');
+            location.reload();
+        } catch (error) {
+            console.error('Error deleting current vocabulary:', error);
+            alert('Error deleting current vocabulary.');
+        }
+    }
+
+    function createDeleteCurrentVocabButton(width) {
+        const deleteCurrentVocabButton = createButton('Refresh Current Vocab from API', '10px', deleteCurrentVocab, width);
+        deleteCurrentVocabButton.style.backgroundColor = '#C82800';
+        deleteCurrentVocabButton.style.color = 'white';
+        return deleteCurrentVocabButton;
+    }
+
     function createDeleteButton(width) {
         const deleteButton = createButton('DELETE', '10px', () => {
             createConfirmationPopup(
@@ -1908,7 +2080,7 @@
                 rightContainer.appendChild(numberContainer);
             } else if (typeof value === 'object') {
                 const maxAllowedIndex = hotkeyOptions.length - 1
-                
+
                 let currentValue = value;
                 let choiceIndex = hotkeyOptions.indexOf(currentValue.join(' '));
                 if (choiceIndex === -1) {
@@ -1978,7 +2150,7 @@
 
                 // Initialize button states
                 updateButtonStates();
-    
+
                 rightContainer.appendChild(textContainer);
             }
 
