@@ -1,6 +1,6 @@
 # JPDB Immersion Kit Examples  
 
-A Tampermonkey userscript for **jpdb.io** that embeds anime examples from **ImmersionKit** directly into the site.  
+A userscript for **jpdb.io** that embeds anime examples from **ImmersionKit** directly into the site.  
 
 ## Features  
 
