@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         JPDB Immersion Kit Examples
-// @version      1.23.1
+// @version      1.24
 // @description  Embeds anime images & audio examples into JPDB review and vocabulary pages using Immersion Kit's API. 
 // @author       awoo
 // @namespace    jpdb-immersion-kit-examples
@@ -1175,26 +1175,130 @@
         return wrapperDiv;
     }
 
+    // Detect iOS
+    function isIOS() {
+        return /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+    }
+
+    // Preload images
+    function preloadImages() {
+        // Preload images around the current example index
+        const preloadDiv = GM_addElement(document.body, 'div', { style: 'display: none;' });
+        const startIndex = Math.max(0, state.currentExampleIndex - CONFIG.NUMBER_OF_PRELOADS);
+        const endIndex = Math.min(state.examples.length - 1, state.currentExampleIndex + CONFIG.NUMBER_OF_PRELOADS);
+
+        for (let i = startIndex; i <= endIndex; i++) {
+            if (!state.preloadedIndices.has(i) && state.examples[i].image) {
+                const example = state.examples[i];
+                const imageUrl = `https://us-southeast-1.linodeobjects.com/immersionkit/media/${example.media}/${example.title}/media/${example.image}`;
+                if (isIOS()) {
+                    GM_xmlhttpRequest({
+                        method: 'GET',
+                        url: imageUrl,
+                        responseType: 'blob',
+                        onload: function(response) {
+                            if (response.status === 200 && response.response) {
+                                example.blob = response.response;
+                                state.preloadedIndices.add(i);
+                            }
+                        }
+                    });
+                } else {
+                    GM_addElement(preloadDiv, 'img', { src: imageUrl });
+                    state.preloadedIndices.add(i);
+                }
+            }
+        }
+    }
+
+    // Create image element
     function createImageElement(wrapperDiv, imageUrl, vocab, exactSearch) {
-        // Create and return an image element with specified attributes
         const searchVocab = exactSearch ? `「${vocab}」` : vocab;
         const example = state.examples[state.currentExampleIndex] || {};
-        const title = example.title || null;
+        const title = example.title || '';
+        let file_name = imageUrl.substring(imageUrl.lastIndexOf('/') + 1).replace(/^(Anime_|A_|Z)/, '');
+        const titleText = `${searchVocab} #${state.currentExampleIndex + 1}\n${title}\n${file_name}`;
 
-        // Extract the file name from the URL
-        let file_name = imageUrl.substring(imageUrl.lastIndexOf('/') + 1);
+        if (isIOS()) {
+            // --- Calculate width and 16:9 height from config ---
+            const width = parseInt(CONFIG.IMAGE_WIDTH, 10);
+            const height = Math.round(width * 9 / 16);
 
-        // Remove prefixes "Anime_", "A_", or "Z" from the file name
-        file_name = file_name.replace(/^(Anime_|A_|Z)/, '');
+            // --- Outer container ---
+            const imgContainer = document.createElement('div');
+            imgContainer.style = `width:${width}px;max-width:${width}px;margin:10px auto 0;position:relative;min-height:${height}px;`;
 
-        const titleText = `${searchVocab} #${state.currentExampleIndex + 1} \n${title} \n${file_name}`;
+            // --- Hidden image until loaded ---
+            const img = document.createElement('img');
+            img.alt = 'Embedded Image';
+            img.title = titleText;
+            img.style = `width:100%;max-width:${width}px;margin-top:10px;cursor:pointer;display:none;border-radius:4px;height:auto;`;
 
-        return GM_addElement(wrapperDiv, 'img', {
-            src: imageUrl,
-            alt: 'Embedded Image',
-            title: titleText,
-            style: `max-width: ${CONFIG.IMAGE_WIDTH}; margin-top: 10px; cursor: pointer;`
+            // --- Error fallback, also 16:9 ---
+            const errorFallback = document.createElement('div');
+            errorFallback.style = `display:none;width:100%;aspect-ratio:16/9;`;
+            errorFallback.innerHTML =
+                `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+                <rect width="${width}" height="${height}" fill="#f8d7da"/>
+                <text x="50%" y="50%" text-anchor="middle" fill="#721c24" dy=".3em" font-size="18">Image failed to load</text>
+            </svg>`;
+
+            imgContainer.append(img, errorFallback);
+            wrapperDiv.appendChild(imgContainer);
+
+            // --- Use cached blob else load ---
+            if (example.blob) {
+                const objectURL = URL.createObjectURL(example.blob);
+                img.src = objectURL;
+                img.onload = () => {
+                    errorFallback.style.display = 'none';
+                    img.style.display = 'block';
+                    URL.revokeObjectURL(objectURL);
+                };
+                img.onerror = () => {
+                    img.style.display = 'none';
+                    errorFallback.style.display = 'block';
+                };
+            } else {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: imageUrl,
+                    responseType: 'blob',
+                    onload: function(response) {
+                        if (response.status === 200 && response.response) {
+                            example.blob = response.response;
+                            const objectURL = URL.createObjectURL(response.response);
+                            img.src = objectURL;
+                            img.onload = () => {
+                                errorFallback.style.display = 'none';
+                                img.style.display = 'block';
+                                URL.revokeObjectURL(objectURL);
+                            };
+                            img.onerror = () => {
+                                img.style.display = 'none';
+                                errorFallback.style.display = 'block';
+                            };
+                        } else {
+                            errorFallback.style.display = 'block';
+                            console.error('Failed to load image:', imageUrl);
+                        }
+                    },
+                    onerror: function() {
+                        errorFallback.style.display = 'block';
+                        console.error('GM_xmlhttpRequest error for', imageUrl);
+                    }
+                });
+            }
+            return img;
+        } else {
+            // Non-iOS: just add the image
+            return GM_addElement(wrapperDiv, 'img', {
+                src: imageUrl,
+                alt: 'Embedded Image',
+                title: titleText,
+                style: `max-width: ${CONFIG.IMAGE_WIDTH}; margin-top: 10px; cursor: pointer;`
         });
+        }
     }
 
     function highlightVocab(sentence, vocab) {
@@ -1410,22 +1514,6 @@
     function replaceSpecialCharacters(text) {
         // Replace special characters in the text
         return text.replace(/<br>/g, '\n').replace(/&quot;/g, '"').replace(/\n/g, '<br>');
-    }
-
-    function preloadImages() {
-        // Preload images around the current example index
-        const preloadDiv = GM_addElement(document.body, 'div', { style: 'display: none;' });
-        const startIndex = Math.max(0, state.currentExampleIndex - CONFIG.NUMBER_OF_PRELOADS);
-        const endIndex = Math.min(state.examples.length - 1, state.currentExampleIndex + CONFIG.NUMBER_OF_PRELOADS);
-
-        for (let i = startIndex; i <= endIndex; i++) {
-            if (!state.preloadedIndices.has(i) && state.examples[i].image) {
-                const example = state.examples[i];
-                const imageUrl = `https://us-southeast-1.linodeobjects.com/immersionkit/media/${example.media}/${example.title}/media/${example.image}`;
-                GM_addElement(preloadDiv, 'img', { src: imageUrl });
-                state.preloadedIndices.add(i);
-            }
-        }
     }
 
 
