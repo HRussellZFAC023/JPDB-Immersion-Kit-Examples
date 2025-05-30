@@ -1209,30 +1209,49 @@
         imgContainer.append(img, errorFallback);
         wrapperDiv.appendChild(imgContainer);
 
-        // --- Load image as blob, swap in when ready ---
-        GM_xmlhttpRequest({
-            method: 'GET',
-            url: imageUrl,
-            responseType: 'blob',
-            onload: function(response) {
-                if (response.status === 200 && response.response) {
-                    const reader = new FileReader();
-                    reader.onloadend = function() {
-                        img.src = reader.result;
-                        img.onload = () => { errorFallback.style.display = 'none'; img.style.display = 'block'; };
-                        img.onerror = () => { img.style.display = 'none'; errorFallback.style.display = 'block'; };
-                    };
-                    reader.readAsDataURL(response.response);
-                } else {
-                    errorFallback.style.display = 'block';
-                    console.error('Failed to load image:', imageUrl);
-                }
-            },
-            onerror: function() {
+        // --- Use cached blob else load ---
+        if (example.blob) {
+            const objectURL = URL.createObjectURL(example.blob);
+            img.src = objectURL;
+            img.onload = () => {
+                errorFallback.style.display = 'none';
+                img.style.display = 'block';
+                URL.revokeObjectURL(objectURL);
+            };
+            img.onerror = () => {
+                img.style.display = 'none';
                 errorFallback.style.display = 'block';
-                console.error('GM_xmlhttpRequest error for', imageUrl);
-            }
-        });
+            };
+        } else {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: imageUrl,
+                responseType: 'blob',
+                onload: function(response) {
+                    if (response.status === 200 && response.response) {
+                        example.blob = response.response;
+                        const objectURL = URL.createObjectURL(response.response);
+                        img.src = objectURL;
+                        img.onload = () => {
+                            errorFallback.style.display = 'none';
+                            img.style.display = 'block';
+                            URL.revokeObjectURL(objectURL);
+                        };
+                        img.onerror = () => {
+                            img.style.display = 'none';
+                            errorFallback.style.display = 'block';
+                        };
+                    } else {
+                        errorFallback.style.display = 'block';
+                        console.error('Failed to load image:', imageUrl);
+                    }
+                },
+                onerror: function() {
+                    errorFallback.style.display = 'block';
+                    console.error('GM_xmlhttpRequest error for', imageUrl);
+                }
+            });
+        }
 
         return img;
     }
@@ -1462,8 +1481,17 @@
             if (!state.preloadedIndices.has(i) && state.examples[i].image) {
                 const example = state.examples[i];
                 const imageUrl = `https://us-southeast-1.linodeobjects.com/immersionkit/media/${example.media}/${example.title}/media/${example.image}`;
-                GM_addElement(preloadDiv, 'img', { src: imageUrl });
-                state.preloadedIndices.add(i);
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: imageUrl,
+                    responseType: 'blob',
+                    onload: function(response) {
+                        if (response.status === 200 && response.response) {
+                            example.blob = response.response;
+                            state.preloadedIndices.add(i);
+                        }
+                    }
+                });
             }
         }
     }
